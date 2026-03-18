@@ -1,0 +1,26 @@
+# Binaries
+aws_extractor
+aws_extractor-*
+*.exe
+
+# Go build artifacts
+*.out
+*.test
+
+# Output files from running the tool
+results.txt
+results.json
+results.csv
+*_buckets.txt
+logs.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
