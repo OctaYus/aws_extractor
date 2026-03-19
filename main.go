@@ -54,28 +54,35 @@ type CrawlResult struct {
 
 // OutputFiles handles file output operations
 type OutputFiles struct {
-	outputFile  string
-	bucketsFile string
-	mu          sync.Mutex
+	outputFile   string
+	bucketsFile  string
+	resultsFile  string
+	outputFormat string
+	mu           sync.Mutex
+	resultsMu    sync.Mutex
 }
 
 // NewOutputFiles creates a new OutputFiles instance
-func NewOutputFiles(outputFile string) *OutputFiles {
-	var bucketsFile string
+func NewOutputFiles(outputFile string, format string) *OutputFiles {
+	var bucketsFile, resultsFile string
 	if outputFile != "" {
 		ext := ""
 		idx := strings.LastIndex(outputFile, ".")
+		baseName := outputFile
 		if idx != -1 {
 			ext = outputFile[idx:]
-			outputFile = outputFile[:idx]
+			baseName = outputFile[:idx]
 		}
-		bucketsFile = outputFile + "_buckets.txt"
-		outputFile = outputFile + ext
+		bucketsFile = baseName + "_buckets.txt"
+		resultsFile = baseName + "_results_live." + format
+		outputFile = baseName + ext
 	}
 
 	return &OutputFiles{
-		outputFile:  outputFile,
-		bucketsFile: bucketsFile,
+		outputFile:   outputFile,
+		bucketsFile:  bucketsFile,
+		resultsFile:  resultsFile,
+		outputFormat: format,
 	}
 }
 
@@ -103,6 +110,34 @@ func (of *OutputFiles) MakeFile() error {
 		f.WriteString("# Format: bucket-name | source-url\n")
 		f.WriteString("# " + strings.Repeat("=", 76) + "\n\n")
 		log.Infof("%s[+] Buckets file created: %s%s", color.GREEN, of.bucketsFile, color.END)
+	}
+
+	// Create live results file
+	if of.resultsFile != "" {
+		if of.outputFormat == "txt" {
+			f, err := os.Create(of.resultsFile)
+			if err != nil {
+				return fmt.Errorf("error creating live results file: %w", err)
+			}
+			defer f.Close()
+			f.WriteString("AWS S3 Bucket Crawler Results (Live)\n")
+			f.WriteString(strings.Repeat("=", 80) + "\n\n")
+		} else if of.outputFormat == "json" {
+			// Create empty JSON array
+			if err := os.WriteFile(of.resultsFile, []byte("[]"), 0644); err != nil {
+				return fmt.Errorf("error creating live results file: %w", err)
+			}
+		} else if of.outputFormat == "csv" {
+			f, err := os.Create(of.resultsFile)
+			if err != nil {
+				return fmt.Errorf("error creating live results file: %w", err)
+			}
+			defer f.Close()
+			writer := csv.NewWriter(f)
+			writer.Write([]string{"URL", "Status", "Buckets Found", "Bucket Names", "Error"})
+			writer.Flush()
+		}
+		log.Infof("%s[+] Live results file created: %s%s", color.GREEN, of.resultsFile, color.END)
 	}
 
 	return nil
@@ -134,7 +169,107 @@ func (of *OutputFiles) SaveBucketImmediately(bucket, sourceURL string) {
 	fmt.Printf("%s%s%s%s\n\n", color.BOLD, color.GREEN, strings.Repeat("─", 80), color.END)
 }
 
-// SaveResults saves crawling results to file
+// SaveResultImmediately saves a crawl result immediately (thread-safe)
+func (of *OutputFiles) SaveResultImmediately(result CrawlResult) {
+	if of.resultsFile == "" {
+		return
+	}
+
+	of.resultsMu.Lock()
+	defer of.resultsMu.Unlock()
+
+	switch of.outputFormat {
+	case "txt":
+		of.saveResultTXT(result)
+	case "json":
+		of.saveResultJSON(result)
+	case "csv":
+		of.saveResultCSV(result)
+	}
+}
+
+func (of *OutputFiles) saveResultTXT(result CrawlResult) {
+	f, err := os.OpenFile(of.resultsFile, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Errorf("%s(-) Error saving result: %v%s", color.RED, err, color.END)
+		return
+	}
+	defer f.Close()
+
+	status := result.Error
+	if result.Status != 0 {
+		status = fmt.Sprintf("%d", result.Status)
+	}
+
+	fmt.Fprintf(f, "URL: %s\n", result.URL)
+	fmt.Fprintf(f, "Status: %s\n", status)
+
+	if len(result.Buckets) > 0 {
+		fmt.Fprintf(f, "Buckets found (%d):\n", len(result.Buckets))
+		for _, bucket := range result.Buckets {
+			fmt.Fprintf(f, "  - %s\n", bucket)
+		}
+	} else {
+		f.WriteString("No buckets found\n")
+	}
+	f.WriteString(strings.Repeat("-", 80) + "\n\n")
+}
+
+func (of *OutputFiles) saveResultJSON(result CrawlResult) {
+	// Read existing results
+	data, err := os.ReadFile(of.resultsFile)
+	if err != nil {
+		log.Errorf("%s(-) Error reading results file: %v%s", color.RED, err, color.END)
+		return
+	}
+
+	var results []CrawlResult
+	if err := json.Unmarshal(data, &results); err != nil {
+		log.Errorf("%s(-) Error parsing JSON: %v%s", color.RED, err, color.END)
+		return
+	}
+
+	// Append new result
+	results = append(results, result)
+
+	// Write back
+	newData, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		log.Errorf("%s(-) Error marshaling JSON: %v%s", color.RED, err, color.END)
+		return
+	}
+
+	if err := os.WriteFile(of.resultsFile, newData, 0644); err != nil {
+		log.Errorf("%s(-) Error writing JSON: %v%s", color.RED, err, color.END)
+	}
+}
+
+func (of *OutputFiles) saveResultCSV(result CrawlResult) {
+	f, err := os.OpenFile(of.resultsFile, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Errorf("%s(-) Error saving result: %v%s", color.RED, err, color.END)
+		return
+	}
+	defer f.Close()
+
+	writer := csv.NewWriter(f)
+	defer writer.Flush()
+
+	status := ""
+	if result.Status != 0 {
+		status = fmt.Sprintf("%d", result.Status)
+	}
+
+	writer.Write([]string{
+		result.URL,
+		status,
+		fmt.Sprintf("%d", len(result.Buckets)),
+		strings.Join(result.Buckets, ", "),
+		result.Error,
+	})
+}
+
+// SaveResults saves final crawling results to file
 func (of *OutputFiles) SaveResults(results []CrawlResult, format string) error {
 	switch format {
 	case "json":
@@ -364,6 +499,7 @@ type WebCrawler struct {
 	userAgent      string
 	patternMatcher *S3PatternMatcher
 	client         *http.Client
+	outputHandler  *OutputFiles
 }
 
 // NewWebCrawler creates a new WebCrawler
@@ -390,6 +526,7 @@ func NewWebCrawler(timeout int, maxWorkers int, userAgent string, outputHandler 
 		userAgent:      userAgent,
 		patternMatcher: NewS3PatternMatcher(outputHandler),
 		client:         client,
+		outputHandler:  outputHandler,
 	}
 }
 
@@ -406,6 +543,10 @@ func (wc *WebCrawler) CrawlURL(url string) CrawlResult {
 	if err != nil {
 		result.Error = fmt.Sprintf("Request error: %v", err)
 		log.Errorf("%s(-) Request error for %s: %v%s", color.RED, url, err, color.END)
+		// Save immediately even on error
+		if wc.outputHandler != nil {
+			wc.outputHandler.SaveResultImmediately(result)
+		}
 		return result
 	}
 
@@ -423,6 +564,10 @@ func (wc *WebCrawler) CrawlURL(url string) CrawlResult {
 			result.Error = fmt.Sprintf("Request error: %v", err)
 			log.Errorf("%s(-) Request error for %s: %v%s", color.RED, url, err, color.END)
 		}
+		// Save immediately even on error
+		if wc.outputHandler != nil {
+			wc.outputHandler.SaveResultImmediately(result)
+		}
 		return result
 	}
 	defer resp.Body.Close()
@@ -435,6 +580,10 @@ func (wc *WebCrawler) CrawlURL(url string) CrawlResult {
 		if err != nil {
 			result.Error = fmt.Sprintf("Read error: %v", err)
 			log.Errorf("%s(-) Read error for %s: %v%s", color.RED, url, err, color.END)
+			// Save immediately even on error
+			if wc.outputHandler != nil {
+				wc.outputHandler.SaveResultImmediately(result)
+			}
 			return result
 		}
 
@@ -452,6 +601,11 @@ func (wc *WebCrawler) CrawlURL(url string) CrawlResult {
 	} else {
 		result.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
 		log.Warnf("%s[!] Non-200 status: HTTP %d for %s%s", color.YELLOW, resp.StatusCode, url, color.END)
+	}
+
+	// Save result immediately after processing
+	if wc.outputHandler != nil {
+		wc.outputHandler.SaveResultImmediately(result)
 	}
 
 	return result
@@ -661,7 +815,7 @@ func main() {
 	// Initialize output handler
 	var outputHandler *OutputFiles
 	if *output != "" {
-		outputHandler = NewOutputFiles(*output)
+		outputHandler = NewOutputFiles(*output, *format)
 		if err := outputHandler.MakeFile(); err != nil {
 			log.Errorf("%s(-) Error creating output files: %v%s", color.RED, err, color.END)
 			os.Exit(1)
