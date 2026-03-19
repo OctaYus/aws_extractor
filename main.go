@@ -354,6 +354,180 @@ func (of *OutputFiles) saveTXT(results []CrawlResult) error {
 	return nil
 }
 
+// BucketTester handles S3 bucket accessibility testing
+type BucketTester struct {
+	client        *http.Client
+	outputHandler *OutputFiles
+	mu            sync.Mutex
+}
+
+// NewBucketTester creates a new BucketTester
+func NewBucketTester(outputHandler *OutputFiles) *BucketTester {
+	return &BucketTester{
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse // Don't follow redirects
+			},
+		},
+		outputHandler: outputHandler,
+	}
+}
+
+// BucketStatus represents the status of a tested bucket
+type BucketStatus struct {
+	Bucket     string
+	StatusCode int
+	Status     string
+	Takeover   bool
+}
+
+// TestBucket tests if a bucket exists and is takeover-able
+func (bt *BucketTester) TestBucket(bucket string) BucketStatus {
+	result := BucketStatus{
+		Bucket:   bucket,
+		Takeover: false,
+	}
+
+	// Test URL
+	testURL := fmt.Sprintf("https://%s.s3.amazonaws.com/", bucket)
+
+	req, err := http.NewRequest("HEAD", testURL, nil)
+	if err != nil {
+		result.Status = "Request Error"
+		return result
+	}
+
+	resp, err := bt.client.Do(req)
+	if err != nil {
+		result.Status = "Connection Error"
+		return result
+	}
+	defer resp.Body.Close()
+
+	result.StatusCode = resp.StatusCode
+
+	switch resp.StatusCode {
+	case 200:
+		result.Status = "Exists - Public"
+		log.Infof("%s[+] Bucket exists (Public): %s%s", color.GREEN, bucket, color.END)
+	case 403:
+		result.Status = "Exists - Private"
+		log.Infof("%s[+] Bucket exists (Private): %s%s", color.YELLOW, bucket, color.END)
+	case 404:
+		result.Status = "Not Found - Takeover Possible"
+		result.Takeover = true
+		log.Warnf("%s[!] TAKEOVER POSSIBLE: %s%s", color.RED, bucket, color.END)
+
+		// Print to terminal prominently
+		fmt.Printf("\n%s%s%s%s\n", color.BOLD, color.RED, strings.Repeat("!", 80), color.END)
+		fmt.Printf("%s%s[TAKEOVER POSSIBLE]%s\n", color.BOLD, color.RED, color.END)
+		fmt.Printf("%s  Bucket: %s%s\n", color.RED, bucket, color.END)
+		fmt.Printf("%s  Status: 404 Not Found%s\n", color.RED, color.END)
+		fmt.Printf("%s  Action: This bucket can potentially be registered!%s\n", color.YELLOW, color.END)
+		fmt.Printf("%s%s%s%s\n\n", color.BOLD, color.RED, strings.Repeat("!", 80), color.END)
+
+		// Save to takeover file
+		bt.saveTakeoverBucket(bucket)
+	default:
+		result.Status = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		log.Debugf("%s[*] Bucket %s returned: %d%s", color.CYAN, bucket, resp.StatusCode, color.END)
+	}
+
+	return result
+}
+
+// saveTakeoverBucket saves a takeover-able bucket to file
+func (bt *BucketTester) saveTakeoverBucket(bucket string) {
+	if bt.outputHandler == nil || bt.outputHandler.bucketsFile == "" {
+		return
+	}
+
+	bt.mu.Lock()
+	defer bt.mu.Unlock()
+
+	// Create takeover file name
+	takeoverFile := strings.Replace(bt.outputHandler.bucketsFile, "_buckets.txt", "_takeover.txt", 1)
+
+	// Check if file exists, if not create with header
+	if _, err := os.Stat(takeoverFile); os.IsNotExist(err) {
+		f, err := os.Create(takeoverFile)
+		if err != nil {
+			log.Errorf("%s(-) Error creating takeover file: %v%s", color.RED, err, color.END)
+			return
+		}
+		f.WriteString("# Potentially Takeover-able S3 Buckets (404 Not Found)\n")
+		f.WriteString("# These buckets returned 404 and may be registered\n")
+		f.WriteString("# " + strings.Repeat("=", 76) + "\n\n")
+		f.Close()
+		log.Infof("%s[+] Takeover file created: %s%s", color.GREEN, takeoverFile, color.END)
+	}
+
+	// Append bucket
+	f, err := os.OpenFile(takeoverFile, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Errorf("%s(-) Error opening takeover file: %v%s", color.RED, err, color.END)
+		return
+	}
+	defer f.Close()
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	fmt.Fprintf(f, "%s | %s\n", bucket, timestamp)
+}
+
+// TestBuckets tests multiple buckets concurrently
+func (bt *BucketTester) TestBuckets(buckets []string, maxWorkers int) []BucketStatus {
+	results := make([]BucketStatus, 0, len(buckets))
+	var mu sync.Mutex
+
+	log.Infof("%s[+] Testing %d bucket(s) for takeover potential%s", color.GREEN, len(buckets), color.END)
+
+	// Create worker pool
+	jobs := make(chan string, len(buckets))
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for bucket := range jobs {
+				status := bt.TestBucket(bucket)
+
+				mu.Lock()
+				results = append(results, status)
+				mu.Unlock()
+			}
+		}()
+	}
+
+	// Send jobs
+	for _, bucket := range buckets {
+		jobs <- bucket
+	}
+	close(jobs)
+
+	// Wait for completion
+	wg.Wait()
+
+	// Summary
+	takeovers := 0
+	exists := 0
+	for _, r := range results {
+		if r.Takeover {
+			takeovers++
+		} else if r.StatusCode == 200 || r.StatusCode == 403 {
+			exists++
+		}
+	}
+
+	log.Infof("%s[+] Testing complete:%s", color.GREEN, color.END)
+	log.Infof("%s    - Buckets exist: %d%s", color.GREEN, exists, color.END)
+	log.Infof("%s    - Takeover possible: %d%s", color.RED, takeovers, color.END)
+
+	return results
+}
+
 // S3PatternMatcher handles S3 bucket pattern matching and validation
 type S3PatternMatcher struct {
 	patterns      []*regexp.Regexp
@@ -778,6 +952,7 @@ func main() {
 	verbose := flag.Bool("v", false, "Verbose output (show progress per URL)")
 	userAgent := flag.String("user-agent", "", "Custom User-Agent string")
 	debug := flag.Bool("debug", false, "Enable debug logging")
+	testTakeover := flag.Bool("test-takeover", false, "Test found buckets for takeover potential")
 
 	flag.Parse()
 
@@ -837,6 +1012,33 @@ func main() {
 			log.Errorf("%s(-) Error saving results: %v%s", color.RED, err, color.END)
 		} else {
 			log.Infof("%s[+] Results saved to %s%s", color.GREEN, outputHandler.outputFile, color.END)
+		}
+	}
+
+	// Test buckets for takeover if flag is set
+	if *testTakeover {
+		// Collect all unique buckets
+		bucketsMap := make(map[string]bool)
+		for _, r := range results {
+			for _, bucket := range r.Buckets {
+				bucketsMap[bucket] = true
+			}
+		}
+
+		buckets := make([]string, 0, len(bucketsMap))
+		for bucket := range bucketsMap {
+			buckets = append(buckets, bucket)
+		}
+
+		if len(buckets) > 0 {
+			log.Infof("%s%s%s", color.CYAN, strings.Repeat("=", 80), color.END)
+			log.Infof("%s[+] BUCKET TAKEOVER TESTING%s", color.GREEN, color.END)
+			log.Infof("%s%s%s", color.CYAN, strings.Repeat("=", 80), color.END)
+
+			tester := NewBucketTester(outputHandler)
+			tester.TestBuckets(buckets, *workers)
+		} else {
+			log.Warnf("%s[!] No buckets to test%s", color.YELLOW, color.END)
 		}
 	}
 
